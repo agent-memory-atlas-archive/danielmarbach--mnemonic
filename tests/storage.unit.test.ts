@@ -6,6 +6,7 @@ import {
   validateNoteProjection,
 } from "../src/validation.js";
 import type { EmbeddingModelId, ISO8601DateString, MemoryId } from "../src/brands.js";
+import { canonicalProjectId, normalizeRemoteUrl } from "../src/project.js";
 import * as fs from "fs/promises";
 import * as path from "path";
 import os from "os";
@@ -116,6 +117,64 @@ describe("Storage", () => {
       expect(read!.lifecycle).toBe("permanent");
       expect(read!.memoryVersion).toBe(0); // Legacy notes normalize to pre-v0.2.0 schema
     });
+
+    it("should canonicalize a legacy scheme-prefixed project id when parsing", async () => {
+      const notesDir = path.join(tempDir, "notes");
+      const content = `---
+title: Legacy project id
+tags: []
+lifecycle: permanent
+project: https-github-com-acme-myapp
+projectName: myapp
+createdAt: 2023-01-01T00:00:00.000Z
+updatedAt: 2023-01-01T00:00:00.000Z
+---
+
+Body`;
+      await fs.writeFile(path.join(notesDir, "legacy-project.md"), content, "utf-8");
+
+      const full = await storage.readNote("legacy-project" as MemoryId);
+      const metadata = await storage.readNoteMetadata("legacy-project" as MemoryId);
+      const listed = await storage.listNotesMetadata({ project: "github-com-acme-myapp" });
+
+      expect(full?.project).toBe("github-com-acme-myapp");
+      expect(metadata?.project).toBe("github-com-acme-myapp");
+      expect(listed.map((note) => note.id)).toEqual(["legacy-project"]);
+
+      await storage.writeNote(full!);
+      expect(await fs.readFile(path.join(notesDir, "legacy-project.md"), "utf-8")).toContain(
+        "project: github-com-acme-myapp",
+      );
+    });
+
+    it.each([
+      ["git@ssh.dev.azure.com:v3/org/proj/repo", "ssh-dev-azure-com-v3-org-proj-repo"],
+      ["git@github.com:1234/repo.git", "github-com-1234-repo"],
+    ])(
+      "keeps the resolver id for %s unchanged through write and read",
+      async (remote, expectedId) => {
+        const id = normalizeRemoteUrl(remote);
+        const now = new Date().toISOString() as ISO8601DateString;
+        expect(id).toBe(expectedId);
+
+        await storage.writeNote({
+          id: "resolver-id-note" as MemoryId,
+          title: "Resolver id",
+          content: "Body",
+          tags: [],
+          lifecycle: "permanent",
+          project: id,
+          projectName: "repo",
+          createdAt: now,
+          updatedAt: now,
+          memoryVersion: 1,
+        });
+
+        const read = await storage.readNote("resolver-id-note" as MemoryId);
+        expect(read?.project).toBe(id);
+        expect(canonicalProjectId(id)).toBe(id);
+      },
+    );
 
     it("should normalize invalid lifecycle values to permanent", async () => {
       const notesDir = path.join(tempDir, "notes");

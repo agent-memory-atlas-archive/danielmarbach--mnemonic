@@ -10,8 +10,9 @@ import type {
   MnemonicVaultAttachmentConfig,
   DocumentSourceAttachmentConfig,
 } from "../vault.js";
-import { detectDefaultBranch } from "../attached-storage.js";
-import { attachmentSlug, type AttachmentSlug } from "../brands.js";
+import { detectDefaultBranch, validateBranch } from "../attached-storage.js";
+import { attachmentSlug } from "../brands.js";
+import { normalizeRemoteUrl } from "../project.js";
 import { resolveProject as resolveProjectFromModule } from "../helpers/project.js";
 import { projectNotFoundResponse } from "../helpers/vault.js";
 import { formatCommitBody } from "../helpers/git-commit.js";
@@ -22,21 +23,11 @@ import {
 } from "../helpers/persistence.js";
 import { AddAttachmentResultSchema, type AddAttachmentResult } from "../structured-content.js";
 import { invalidateActiveProjectCache } from "../cache.js";
-import { attempt } from "../error-utils.js";
+import { attempt, attemptSync, getErrorMessage } from "../error-utils.js";
 import { expandHomePath, collapseHomePath } from "../paths.js";
 
 function generateAttachmentId(): string {
   return crypto.randomUUID();
-}
-
-function normalizeRemote(remote: string): AttachmentSlug {
-  let s = remote.trim().toLowerCase();
-  s = s.replace(/^git@/, "").replace(/:/, "/");
-  s = s.replace(/^https?:\/\//, "").replace(/^ssh:\/\//, "");
-  s = s.replace(/^[^@]*@/, "");
-  s = s.replace(/\.git$/, "");
-  s = s.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return attachmentSlug(s);
 }
 
 function extractRepoName(remote: string): string {
@@ -214,7 +205,7 @@ export function registerAddAttachmentTool(server: McpServer, ctx: ServerContext)
       }
 
       const remoteUrl = remoteResult.trim();
-      const slug = normalizeRemote(remoteUrl);
+      const slug = attachmentSlug(normalizeRemoteUrl(remoteUrl));
       const name = extractRepoName(remoteUrl);
 
       const maxAttachments = await ctx.configStore.getMaxAttachmentsPerProject();
@@ -328,6 +319,19 @@ export function registerAddAttachmentTool(server: McpServer, ctx: ServerContext)
           };
         }
 
+        for (const name of [branch, pushBranch]) {
+          if (name === undefined || name.trim() === "") continue;
+          const validated = attemptSync("add-attachment:validate-branch", () =>
+            validateBranch(name.trim()),
+          );
+          if (!validated.ok) {
+            return {
+              content: [{ type: "text", text: getErrorMessage(validated.error) }],
+              isError: true,
+            };
+          }
+        }
+
         let effectiveBranch: string;
         if (branch !== undefined && branch.trim() !== "") {
           effectiveBranch = branch.trim();
@@ -354,7 +358,7 @@ export function registerAddAttachmentTool(server: McpServer, ctx: ServerContext)
           updatedAt: now,
           branchTipHash,
           writable: writable ?? false,
-          pushBranch: pushBranch ?? undefined,
+          pushBranch: pushBranch?.trim() || undefined,
         };
         config = vaultConfig;
       }

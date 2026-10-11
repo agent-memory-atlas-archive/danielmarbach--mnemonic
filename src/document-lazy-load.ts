@@ -3,6 +3,7 @@ import { promisify } from "util";
 import path from "path";
 import type { DocumentGeneration } from "./retrieval-document.js";
 import { readManifest, computeAttachmentConfigHash } from "./document-manifest.js";
+import { canonicalProjectId } from "./project.js";
 import { buildGenerationFromFiles } from "./document-source-index.js";
 import {
   getCurrentGeneration,
@@ -13,6 +14,7 @@ import { getExtractor } from "./document-extractor.js";
 import { markdownChunker } from "./markdown-chunker.js";
 import { ChunkEmbeddingStorage } from "./chunk-embedding-storage.js";
 import { attempt, getErrorMessage } from "./error-utils.js";
+import { splitNulSeparated } from "./git-output.js";
 import { expandHomePath } from "./paths.js";
 import { matchAnyGlob } from "./glob-match.js";
 import type { DocumentSourceAttachmentConfig } from "./vault.js";
@@ -44,7 +46,7 @@ async function enumerateFilesAtCommit(
     }).then((result) => result.stdout);
 
   const lsTreeResult = await attempt("lazy-load:ls-tree", () =>
-    run(["ls-tree", "-r", "--name-only", indexedCommit]),
+    run(["ls-tree", "-r", "-z", "--name-only", indexedCommit]),
   );
   if (!lsTreeResult.ok) {
     console.error(
@@ -53,7 +55,7 @@ async function enumerateFilesAtCommit(
     return null;
   }
 
-  const allFiles = lsTreeResult.value.trim().split("\n").filter(Boolean);
+  const allFiles = splitNulSeparated(lsTreeResult.value);
   const root = config.root || ".";
   const includePatterns = config.include.length > 0 ? config.include : ["**/*.md"];
   const excludePatterns = config.exclude || [];
@@ -262,7 +264,11 @@ export async function lazyLoadGeneration(
     // Validate manifest identity against function parameters and current config.
     // A mismatch means the manifest is stale (config changed, or the file was
     // copied from another project/attachment) — force a re-sync by returning null.
-    if (manifest.projectId !== projectId || manifest.attachmentId !== attachmentId) {
+    // Manifests written before project ids were unified carry the legacy scheme-prefixed id.
+    if (
+      canonicalProjectId(manifest.projectId) !== projectId ||
+      manifest.attachmentId !== attachmentId
+    ) {
       console.error(
         `[lazy-load] manifest binding mismatch for ${attachmentId} — run sync to index document sources`,
       );

@@ -1,10 +1,18 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   VaultManager,
   type MnemonicVaultAttachmentConfig,
   type ProjectAttachmentConfig,
 } from "../src/vault.js";
-import { Storage, type Note } from "../src/storage.js";
+import { Migrator } from "../src/migration.js";
+import {
+  readVaultSchemaVersion,
+  readVaultSchemaVersionForMigration,
+  writeVaultSchemaVersion,
+} from "../src/config.js";
+import { warnAboutPendingMigrationsOnStartup } from "../src/startup.js";
+import type { ServerContext } from "../src/server-context.js";
+import { Storage, type Note, type EmbeddingRecord } from "../src/storage.js";
 import type { MemoryId, ISO8601DateString } from "../src/brands.js";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -70,6 +78,80 @@ describe("VaultManager", () => {
 
       expect(content).toContain("embeddings/");
     });
+
+    it("records the current schema version when creating a new main vault", async () => {
+      expect(await readVaultSchemaVersion(mainVaultPath)).toBe("1.5");
+      const raw = await fs.readFile(path.join(mainVaultPath, "config.json"), "utf-8");
+      expect(JSON.parse(raw)).toEqual({ schemaVersion: "1.5" });
+    });
+
+    it("reports no pending migrations on startup for a new main vault", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      try {
+        await warnAboutPendingMigrationsOnStartup({
+          vaultManager,
+          migrator: new Migrator(vaultManager),
+        } as unknown as ServerContext);
+
+        expect(errorSpy).not.toHaveBeenCalled();
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("leaves an existing main vault with notes but no config.json pending", async () => {
+      const legacyVaultPath = path.join(tempDir, "legacy-main-vault");
+      const legacyStorage = new Storage(legacyVaultPath);
+      await legacyStorage.init();
+      await legacyStorage.writeNote({
+        id: "legacy-main-note" as MemoryId,
+        title: "Legacy Main Note",
+        content: "Written before config.json existed",
+        tags: [],
+        lifecycle: "permanent",
+        createdAt: new Date().toISOString() as ISO8601DateString,
+        updatedAt: new Date().toISOString() as ISO8601DateString,
+      });
+
+      const legacyManager = new VaultManager(legacyVaultPath);
+      await legacyManager.initMain();
+
+      await expect(fs.access(path.join(legacyVaultPath, "config.json"))).rejects.toThrow();
+      expect(await readVaultSchemaVersionForMigration(legacyVaultPath)).toBe("0.0");
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await warnAboutPendingMigrationsOnStartup({
+          vaultManager: legacyManager,
+          migrator: new Migrator(legacyManager),
+        } as unknown as ServerContext);
+
+        expect(errorSpy).toHaveBeenCalled();
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("commits the schema version when creating a new main vault with git enabled", async () => {
+      delete process.env.DISABLE_GIT;
+      const gitMainPath = path.join(tempDir, "git-main-vault");
+      await fs.mkdir(gitMainPath, { recursive: true });
+      const git = simpleGit(gitMainPath);
+      await git.init();
+      await git.addConfig("user.email", "test@example.com");
+      await git.addConfig("user.name", "Test");
+      await git.addConfig("commit.gpgsign", "false");
+      const gitManager = new VaultManager(gitMainPath);
+      await gitManager.initMain();
+
+      const log = await git.log();
+      expect(log.all.map((entry) => entry.message)).toContain(
+        "config(init): record vault schema version 1.5",
+      );
+      expect((await git.status()).files.map((f) => f.path)).not.toContain("config.json");
+
+      process.env.DISABLE_GIT = "true";
+    });
   });
 
   describe("Project Vault Detection", () => {
@@ -115,6 +197,71 @@ describe("VaultManager", () => {
       const existsAfter = await vaultManager.getProjectVaultIfExists(projectDir);
       expect(existsAfter).toBeTruthy();
       expect(existsAfter!.storage.vaultPath).toBe(vault!.storage.vaultPath);
+    });
+
+    it("records the current schema version when creating a new project vault", async () => {
+      const projectDir = path.join(tempDir, "project-schema");
+      await fs.mkdir(projectDir, { recursive: true });
+      await initGitRepo(projectDir, "# Project Schema");
+
+      const vault = await vaultManager.getOrCreateProjectVault(projectDir);
+
+      expect(vault).toBeTruthy();
+      expect(await readVaultSchemaVersion(vault!.storage.vaultPath)).toBe("1.5");
+      const raw = await fs.readFile(path.join(projectDir, ".mnemonic", "config.json"), "utf-8");
+      expect(JSON.parse(raw)).toEqual({ schemaVersion: "1.5" });
+    });
+
+    it("reports no pending migrations on startup for a newly created project vault", async () => {
+      const projectDir = path.join(tempDir, "project-startup");
+      await fs.mkdir(projectDir, { recursive: true });
+      await initGitRepo(projectDir, "# Project Startup");
+      await writeVaultSchemaVersion(mainVaultPath, "1.5");
+      await vaultManager.getOrCreateProjectVault(projectDir);
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      try {
+        await warnAboutPendingMigrationsOnStartup({
+          vaultManager,
+          migrator: new Migrator(vaultManager),
+        } as unknown as ServerContext);
+
+        expect(errorSpy).not.toHaveBeenCalled();
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("leaves an existing project vault without config.json pending for migration", async () => {
+      const projectDir = path.join(tempDir, "project-legacy-vault");
+      await fs.mkdir(path.join(projectDir, ".mnemonic", "notes"), { recursive: true });
+      await initGitRepo(projectDir, "# Project Legacy");
+
+      const vault = await vaultManager.getOrCreateProjectVault(projectDir);
+
+      await expect(fs.access(path.join(projectDir, ".mnemonic", "config.json"))).rejects.toThrow();
+      expect(await readVaultSchemaVersionForMigration(vault!.storage.vaultPath)).toBe("0.0");
+    });
+
+    it("commits the schema version when creating a project vault with git enabled", async () => {
+      delete process.env.DISABLE_GIT;
+      const projectDir = path.join(tempDir, "project-schema-commit");
+      await fs.mkdir(projectDir, { recursive: true });
+      await initGitRepoWithCommit(projectDir, "# Project Schema Commit");
+
+      const vaultMgr = new VaultManager(mainVaultPath);
+      await vaultMgr.initMain();
+      await vaultMgr.getOrCreateProjectVault(projectDir);
+
+      const log = await simpleGit(projectDir).log();
+      expect(log.all.map((entry) => entry.message)).toContain(
+        "config(init): record vault schema version 1.5",
+      );
+      expect((await simpleGit(projectDir).status()).files.map((f) => f.path)).not.toContain(
+        ".mnemonic/config.json",
+      );
+
+      process.env.DISABLE_GIT = "true";
     });
 
     it("should not detect main repo as project vault", async () => {
@@ -638,6 +785,77 @@ describe("VaultManager", () => {
       expect(attached).toHaveLength(1);
       expect(attached[0]!.provenance).toBe("project-attached");
       expect(attached[0]!.writable).toBe(false);
+    });
+
+    it("leaves a read-only attached repo's working tree untouched after load and embedding writes", async () => {
+      await vaultManager.getOrCreateProjectVault(projectDir);
+      const attachedPath = path.join(tempDir, "attached-readonly-clean");
+      await setupAttachedVault(attachedPath);
+      await fs.mkdir(path.join(attachedPath, ".mnemonic"), { recursive: true });
+      await fs.writeFile(path.join(attachedPath, ".mnemonic", ".gitignore"), "local-only/\n");
+      await execFileAsync("git", ["add", ".mnemonic/.gitignore"], { cwd: attachedPath });
+      await execFileAsync(
+        "git",
+        [
+          "-c",
+          "user.email=test@example.com",
+          "-c",
+          "user.name=Test",
+          "commit",
+          "-m",
+          "chore: add gitignore",
+        ],
+        { cwd: attachedPath },
+      );
+
+      const config = makeAttachmentConfig({
+        projectSlug: "attached-readonly-clean",
+        localPath: attachedPath,
+      });
+      vaultManager.setAttachmentConfigs("attach-project", [config]);
+      await vaultManager.loadAttachmentsForProject("attach-project");
+
+      const attached = vaultManager.getAttachmentsForProject("attach-project");
+      expect(attached).toHaveLength(1);
+      await attached[0]!.storage.writeEmbedding({
+        id: "emb-1" as MemoryId,
+        model: "test-model" as EmbeddingRecord["model"],
+        embedding: [0.1, 0.2],
+        updatedAt: new Date().toISOString() as ISO8601DateString,
+      });
+
+      const status = await execFileAsync("git", ["status", "--porcelain"], { cwd: attachedPath });
+      expect(status.stdout).toBe("");
+      await expect(fs.access(path.join(attachedPath, ".mnemonic", "embeddings"))).rejects.toThrow();
+      await expect(
+        fs.access(path.join(attachedPath, ".mnemonic", "projections")),
+      ).rejects.toThrow();
+      expect(await fs.readFile(path.join(attachedPath, ".mnemonic", ".gitignore"), "utf-8")).toBe(
+        "local-only/\n",
+      );
+    });
+
+    it("appends each read-only attachment exclude line exactly once across repeated loads", async () => {
+      await vaultManager.getOrCreateProjectVault(projectDir);
+      const attachedPath = path.join(tempDir, "attached-readonly-exclude");
+      await setupAttachedVault(attachedPath);
+      const excludePath = path.join(attachedPath, ".git", "info", "exclude");
+      // CRLF pre-existing content: the lines written by a first load must still be recognised
+      await fs.mkdir(path.dirname(excludePath), { recursive: true });
+      await fs.writeFile(excludePath, "# local\r\n/.mnemonic/embeddings/\r\n");
+
+      const config = makeAttachmentConfig({
+        projectSlug: "attached-readonly-exclude",
+        localPath: attachedPath,
+      });
+      vaultManager.setAttachmentConfigs("attach-project", [config]);
+      await vaultManager.loadAttachmentsForProject("attach-project");
+      await vaultManager.loadAttachmentsForProject("attach-project");
+
+      const lines = (await fs.readFile(excludePath, "utf-8")).split(/\r?\n/);
+      for (const dir of ["attachments", "embeddings", "projections"]) {
+        expect(lines.filter((line) => line === `/.mnemonic/${dir}/`)).toHaveLength(1);
+      }
     });
 
     it("should have writable=true for project-local provenance", async () => {

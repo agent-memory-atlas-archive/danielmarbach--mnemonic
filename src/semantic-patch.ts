@@ -1,4 +1,4 @@
-import type { Root, Content, Heading, Paragraph, Blockquote, List } from "mdast";
+import type { Root, Content, Heading, Paragraph, Blockquote, List, PhrasingContent } from "mdast";
 import { parseBody, serializeBody } from "./markdown-ast.js";
 import { attemptCleanMarkdown } from "./markdown.js";
 import { SemanticPatchError } from "./domain-errors.js";
@@ -25,11 +25,15 @@ export interface SemanticPatch {
   operation: SemanticOperation;
 }
 
+function getPhrasingText(node: PhrasingContent): string {
+  if ("value" in node) return node.value;
+  if ("children" in node) return node.children.map(getPhrasingText).join("");
+  if ("alt" in node) return node.alt ?? "";
+  return "";
+}
+
 function getHeadingText(node: Heading): string {
-  return node.children
-    .filter((c): c is { type: "text"; value: string } => c.type === "text")
-    .map((c) => c.value)
-    .join("");
+  return node.children.map(getPhrasingText).join("");
 }
 
 function isHeadingNode(node: Content): node is Heading {
@@ -134,6 +138,25 @@ function parseValueNodes(value: string): Content[] {
   return fragment.children;
 }
 
+// Adjacent lists re-parse as one loose list, so fold the new items into the existing list instead.
+function mergeIntoAdjacentList(
+  existing: Content | undefined,
+  incoming: Content | undefined,
+  position: "end" | "start",
+): boolean {
+  if (existing?.type !== "list" || incoming?.type !== "list") return false;
+  if (Boolean(existing.ordered) !== Boolean(incoming.ordered)) return false;
+  for (const item of incoming.children) {
+    item.spread = existing.spread;
+  }
+  if (position === "end") {
+    existing.children.push(...incoming.children);
+  } else {
+    existing.children.unshift(...incoming.children);
+  }
+  return true;
+}
+
 function throwIfHeadingReplaceLooksLikeSectionReplace(
   target: Content,
   selector: SemanticSelector,
@@ -160,6 +183,18 @@ function throwIfHeadingReplaceLooksLikeSectionReplace(
   );
 }
 
+function throwIfSectionSelectorMisused(
+  selector: SemanticSelector,
+  operation: SemanticOperation,
+): void {
+  if ("section" in selector && operation.op !== "replaceSection") {
+    throw new SemanticPatchError(
+      `Section selectors support only the replaceSection operation, not '${operation.op}'. ` +
+        'Use a heading selector instead, e.g. `{ selector: { heading: "..." }, operation: { op: "insertAfter", value: "..." } }` to add content below a heading.',
+    );
+  }
+}
+
 function collectAvailableHeadings(tree: Root): string[] {
   const headings: string[] = [];
   for (const child of tree.children) {
@@ -177,6 +212,7 @@ export async function applySemanticPatches(
   const tree = parseBody(body);
 
   for (const patch of patches) {
+    throwIfSectionSelectorMisused(patch.selector, patch.operation);
     const resolved = resolveSelector(tree, patch.selector);
     if (!resolved) {
       const headings = collectAvailableHeadings(tree);
@@ -204,6 +240,7 @@ export async function applySemanticPatches(
           throw new SemanticPatchError(`Cannot appendChild to node of type '${target.type}'`);
         }
         const newNodes = parseValueNodes(op.value);
+        if (mergeIntoAdjacentList(targetChildren.at(-1), newNodes[0], "end")) newNodes.shift();
         targetChildren.push(...newNodes);
         break;
       }
@@ -213,6 +250,7 @@ export async function applySemanticPatches(
           throw new SemanticPatchError(`Cannot prependChild to node of type '${target.type}'`);
         }
         const newNodes = parseValueNodes(op.value);
+        if (mergeIntoAdjacentList(targetChildren[0], newNodes.at(-1), "start")) newNodes.pop();
         targetChildren.unshift(...newNodes);
         break;
       }
@@ -241,11 +279,13 @@ export async function applySemanticPatches(
       }
       case "insertAfter": {
         const newNodes = parseValueNodes(op.value);
+        if (mergeIntoAdjacentList(target, newNodes[0], "end")) newNodes.shift();
         parent.children.splice(index + 1, 0, ...newNodes);
         break;
       }
       case "insertBefore": {
         const newNodes = parseValueNodes(op.value);
+        if (mergeIntoAdjacentList(target, newNodes.at(-1), "start")) newNodes.pop();
         parent.children.splice(index, 0, ...newNodes);
         break;
       }

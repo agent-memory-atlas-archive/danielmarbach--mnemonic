@@ -10,13 +10,15 @@ tags:
   - phase2
 lifecycle: permanent
 createdAt: '2026-04-25T07:47:46.589Z'
-updatedAt: '2026-05-09T16:09:50.552Z'
+updatedAt: '2026-10-11T06:43:39.049Z'
 role: reference
 alwaysLoad: false
-project: https-github-com-danielmarbach-mnemonic
+project: github-com-danielmarbach-mnemonic
 projectName: mnemonic
 relatedTo:
   - id: rpir-workflow-design-for-mnemonic-research-plan-implement-re-80b00851
+    type: related-to
+  - id: delegated-delivery-lessons-running-pi-subagents-workers-and--dab061f9
     type: related-to
 memoryVersion: 1
 ---
@@ -124,3 +126,15 @@ Changes:
 - Added constraint checklist template (plan constraint → status → evidence)
 - Review handoff template now includes adversarial mandate with 6-point instructions and constraint checklist
 - Removed the old self-review checklist that could be done in same context
+
+### Items 1 to 7 implemented (2026-10-11, shipped with 1.0.0)
+
+- 1 Commit hygiene gate: six steps including `git diff -- <paths>` and `git diff --cached --stat` under Commit Discipline.
+- 2 Dirty worktree safety rules: named block, with the autonomous-mode variant (leave unrelated files unstaged and record them in the apply note).
+- 3 Commit-class transitions: table of class, required artifacts and exit gate.
+- 4 Verification evidence block: already present since 0.4x, kept.
+- 5 Closeout templates: kept, plus a Phase closeout checklist in closeout-templates.md referenced from Consolidate.
+- 6 Branch-finish handshake: new stage 6 Finish (clean status, commits by class, open PR / merge / keep / discard, never push, merge, tag or publish without authorization, option recorded in the summary note).
+- 7 Anti-brittleness for heuristic checks: Review D classifies failing advisory or heuristic quality checks as product regression or heuristic brittleness; worded generically because the skill ships to users who have no dogfood packs.
+- New: Autonomous mode. When the user explicitly authorized autonomous delivery, the Research to Plan and Plan to Implement handoffs become recorded checkpoints; stops remain for scope changes, authority changes and materially different readings. Added because this skill's mandatory handoffs conflicted with an explicit autonomy grant during the 1.0.0 run.
+- The MCP prompt `mnemonic-rpi-workflow` mirrors the new stage and mode; its integration test asserts both headings.

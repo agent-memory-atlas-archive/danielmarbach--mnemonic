@@ -87,7 +87,7 @@ export async function resolveProjectIdentity(
 
   return {
     project: {
-      id: projectId(normalizeRemote(overrideRemote)),
+      id: projectId(normalizeRemoteUrl(overrideRemote)),
       name: extractRepoName(overrideRemote),
       source: "git-remote-override",
       remoteName: identityOverride.remoteName,
@@ -118,7 +118,7 @@ async function detectDefaultProject(cwd: string): Promise<ProjectInfo | null> {
   const remoteCwd = topLevelRoot ?? cwd;
   const remote = await getGitRemoteUrl(remoteCwd, "origin");
   if (remote) {
-    const id = projectId(normalizeRemote(remote));
+    const id = projectId(normalizeRemoteUrl(remote));
     const name = extractRepoName(remote);
     return { id, name, source: "git-remote", remoteName: "origin" };
   }
@@ -126,13 +126,13 @@ async function detectDefaultProject(cwd: string): Promise<ProjectInfo | null> {
   // Try git root folder name (repo without remote)
   if (topLevelRoot) {
     const name = path.basename(topLevelRoot);
-    return { id: projectId(slugify(name)), name, source: "git-folder" };
+    return { id: projectId(canonicalProjectId(slugify(name))), name, source: "git-folder" };
   }
 
   // Fallback: just use the directory name
   const name = path.basename(path.resolve(cwd));
   if (name) {
-    return { id: projectId(slugify(name)), name, source: "folder" };
+    return { id: projectId(canonicalProjectId(slugify(name))), name, source: "folder" };
   }
 
   return null;
@@ -181,25 +181,61 @@ async function getGitRemoteUrl(cwd: string, remoteName: string): Promise<string 
 
 /**
  * Normalize a git remote URL to a stable lowercase identifier.
- * Strips protocol, auth, .git suffix, and converts separators to dashes.
+ * Strips scheme, auth, port, .git suffix, and converts separators to dashes,
+ * so every remote form of one repository yields the same id.
  *
  * Examples:
  *   git@github.com:acme/myapp.git  → github-com-acme-myapp
  *   https://github.com/acme/myapp  → github-com-acme-myapp
  */
-function normalizeRemote(remote: string): string {
+export function normalizeRemoteUrl(remote: string): string {
   let s = remote.trim().toLowerCase();
-  // SSH: git@github.com:user/repo.git
-  s = s.replace(/^git@/, "").replace(/:/, "/");
-  // Strip protocol
-  s = s.replace(/^https?:\/\//, "").replace(/^ssh:\/\//, "");
-  // Strip auth (user:pass@)
-  s = s.replace(/^[^@]*@/, "");
-  // Strip .git
+  const hadScheme = /^[a-z][a-z0-9+.-]*:\/\//.test(s);
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//, "");
+  s = s.replace(/^[^@/]*@/, "");
+  // Only a scheme:// URL carries host:port/; scp-like host:path keeps its first colon as a separator
+  s = hadScheme ? s.replace(/^([^/:]+):\d+\//, "$1/") : s.replace(/:/, "/");
   s = s.replace(/\.git$/, "");
-  // Normalise separators
-  s = s.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return s;
+  return canonicalProjectId(slugify(s));
+}
+
+const LEGACY_PROJECT_ID_PREFIXES = ["https-", "http-"] as const;
+
+/**
+ * Map project ids derived from the pre-1.0 normalizer (which kept the scheme
+ * as a prefix) to the canonical id. Other ids are returned unchanged. Only
+ * `https-` and `http-` are stripped: `ssh-` and `git-` are legitimate host
+ * prefixes (`ssh.dev.azure.com`, `git.example.com`). Every id the resolver
+ * produces passes through this function, so it is a fixed point of it.
+ */
+export function canonicalProjectId(id: string): string {
+  let current = id;
+  for (;;) {
+    const prefix = LEGACY_PROJECT_ID_PREFIXES.find(
+      (candidate) => current.startsWith(candidate) && current.length > candidate.length,
+    );
+    if (!prefix) return current;
+    current = current.slice(prefix.length);
+  }
+}
+
+/**
+ * Pick the surviving entry when a legacy key and its canonical key collide:
+ * the newer `updatedAt` wins when both have one, otherwise the entry that was
+ * already stored under the canonical key.
+ */
+export function pickCollidingEntry<T extends { updatedAt?: unknown }>(
+  first: { value: T; wasLegacyKey: boolean },
+  second: { value: T; wasLegacyKey: boolean },
+): { value: T; wasLegacyKey: boolean } {
+  const firstTime =
+    typeof first.value.updatedAt === "string" ? Date.parse(first.value.updatedAt) : NaN;
+  const secondTime =
+    typeof second.value.updatedAt === "string" ? Date.parse(second.value.updatedAt) : NaN;
+  if (!Number.isNaN(firstTime) && !Number.isNaN(secondTime) && firstTime !== secondTime) {
+    return secondTime > firstTime ? second : first;
+  }
+  return first.wasLegacyKey && !second.wasLegacyKey ? second : first;
 }
 
 function extractRepoName(remote: string): string {
